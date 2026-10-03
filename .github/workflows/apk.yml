@@ -1,1 +1,89 @@
+name: APK derle
 
+on:
+  workflow_dispatch:
+  push:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Projeyi bul (klasör ya da zip)
+        shell: bash
+        run: |
+          set -e
+          if [ -f settings.gradle.kts ] && [ -d app ]; then
+            P=.
+          else
+            F=$(find . -path ./.git -prune -o -name settings.gradle.kts -print | head -1)
+            if [ -n "$F" ]; then
+              P=$(dirname "$F")
+            else
+              Z=$(find . -path ./.git -prune -o -iname '*.zip' -print | head -1)
+              if [ -z "$Z" ]; then
+                echo "::warning::Depoda henüz proje (settings.gradle.kts) ya da .zip yok. dns-hizli.zip dosyasını yükleyince derleme kendiliğinden başlar."
+                echo "SKIP=1" >> "$GITHUB_ENV"
+                exit 0
+              fi
+              echo "Zip açılıyor: $Z"
+              unzip -q -o "$Z" -d _proje
+              F=$(find _proje -name settings.gradle.kts | head -1)
+              if [ -z "$F" ]; then
+                echo "::error::Zip içinde settings.gradle.kts yok; doğru zip'i yüklediğinden emin ol."
+                exit 1
+              fi
+              P=$(dirname "$F")
+            fi
+          fi
+          if [ ! -f "$P/app/build.gradle.kts" ] || [ ! -f "$P/app/src/main/AndroidManifest.xml" ]; then
+            echo "::error::Klasör yapısı bozuk: $P/app/src/main/AndroidManifest.xml bulunamadı. Bunun yerine yalnızca zip'i yükle."
+            exit 1
+          fi
+          echo "Proje klasörü: $P"
+          case "$P" in
+            *[!A-Za-z0-9._/-]*) echo "::error::Klasör adında geçersiz karakter: $P"; exit 1 ;;
+          esac
+          echo "PROJ=$P" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-java@v4
+        if: env.SKIP != '1'
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Android SDK parçaları
+        if: env.SKIP != '1'
+        shell: bash
+        run: |
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --licenses > /dev/null || true
+          "$SDKM" "platforms;android-36" "build-tools;35.0.0" "platform-tools" > /dev/null
+          echo "sdk.dir=$ANDROID_HOME" > "$PROJ/local.properties"
+
+      - uses: gradle/actions/setup-gradle@v4
+        if: env.SKIP != '1'
+        with:
+          gradle-version: "8.13"
+
+      - name: Debug APK derle
+        if: env.SKIP != '1'
+        shell: bash
+        working-directory: ${{ env.PROJ }}
+        run: gradle assembleDebug --no-daemon --stacktrace
+
+      - uses: actions/upload-artifact@v4
+        if: env.SKIP != '1'
+        with:
+          name: dns-hizli-apk
+          path: ${{ env.PROJ }}/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
