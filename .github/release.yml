@@ -1,0 +1,131 @@
+# DNS Hızlı — Google Play için imzalı yayın paketi (AAB) + lint raporu. Yalnızca elle çalışır (Actions → Run workflow).
+# Gerekli 4 gizli değer (Settings → Secrets and variables → Actions): KEYSTORE_B64 (anahtar dosyasının base64'ü),
+# KEYSTORE_PASSWORD, KEY_ALIAS, KEY_PASSWORD. Anahtarı kendin üret ve depoya KOYMA (bkz. OKUBENI.md, keystore.properties.example).
+name: Yayin AAB derle
+
+on:
+  workflow_dispatch:
+
+# Yalnızca okuma izni: iş akışı depoya yazamaz. Gizli değerler yalnızca imza adımında okunur.
+permissions:
+  contents: read
+
+# Arka arkaya yükleme yapınca eski derlemeyi iptal et (dakika harcamasın).
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Projeyi bul (klasör ya da zip)
+        shell: bash
+        run: |
+          set -e
+          if [ -f settings.gradle.kts ] && [ -d app ]; then
+            P=.
+          else
+            F=$(find . -path ./.git -prune -o -name settings.gradle.kts -print | head -1)
+            if [ -n "$F" ]; then
+              P=$(dirname "$F")
+            else
+              Z=$(find . -path ./.git -prune -o -iname '*.zip' -print | head -1)
+              if [ -z "$Z" ]; then
+                # İş akışı dosyası zip'ten önce yüklendiyse kırmızı hata yerine uyarı ver ve dur.
+                echo "::warning::Depoda henüz proje (settings.gradle.kts) ya da .zip yok. dns-hizli.zip dosyasını yükleyince derleme kendiliğinden başlar."
+                echo "SKIP=1" >> "$GITHUB_ENV"
+                exit 0
+              fi
+              echo "Zip açılıyor: $Z"
+              unzip -q -o "$Z" -d _proje
+              F=$(find _proje -name settings.gradle.kts | head -1)
+              if [ -z "$F" ]; then
+                echo "::error::Zip içinde settings.gradle.kts yok; doğru zip'i yüklediğinden emin ol."
+                exit 1
+              fi
+              P=$(dirname "$F")
+            fi
+          fi
+          if [ ! -f "$P/app/build.gradle.kts" ] || [ ! -f "$P/app/src/main/AndroidManifest.xml" ]; then
+            echo "::error::Klasör yapısı bozuk: $P/app/src/main/AndroidManifest.xml bulunamadı. Dosyalar tek tek yüklendiyse klasörler kaybolmuş olabilir; bunun yerine yalnızca zip'i yükle."
+            exit 1
+          fi
+          echo "Proje klasörü: $P"
+          # Yol adı yalnızca güvenli karakterler içersin (satır sonu vb. ortam değişkeni enjeksiyonunu önler).
+          case "$P" in
+            *[!A-Za-z0-9._/-]*) echo "::error::Klasör adında geçersiz karakter: $P"; exit 1 ;;
+          esac
+          echo "PROJ=$P" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-java@v6
+        if: env.SKIP != '1'
+        with:
+          distribution: temurin
+          java-version: 25
+
+      - name: Android SDK parçaları
+        if: env.SKIP != '1'
+        shell: bash
+        run: |
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --licenses > /dev/null || true
+          "$SDKM" "platforms;android-36" "build-tools;36.0.0" "platform-tools" > /dev/null
+          echo "sdk.dir=$ANDROID_HOME" > "$PROJ/local.properties"
+
+      - uses: gradle/actions/setup-gradle@v6
+        if: env.SKIP != '1'
+        with:
+          gradle-version: "9.8.0"
+
+      - name: Imza anahtarini hazirla
+        if: env.SKIP != '1'
+        shell: bash
+        working-directory: ${{ env.PROJ }}
+        env:
+          KEYSTORE_B64: ${{ secrets.KEYSTORE_B64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          set -e
+          if [ -z "$KEYSTORE_B64" ] || [ -z "$KEYSTORE_PASSWORD" ] || [ -z "$KEY_ALIAS" ] || [ -z "$KEY_PASSWORD" ]; then
+            echo "::error::KEYSTORE_B64, KEYSTORE_PASSWORD, KEY_ALIAS, KEY_PASSWORD gizli değerlerinin dördü de tanımlı olmalı."
+            exit 1
+          fi
+          echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.jks"
+          {
+            echo "storeFile=$RUNNER_TEMP/release.jks"
+            echo "storePassword=$KEYSTORE_PASSWORD"
+            echo "keyAlias=$KEY_ALIAS"
+            echo "keyPassword=$KEY_PASSWORD"
+          } > keystore.properties
+
+      - name: Lint
+        if: env.SKIP != '1'
+        shell: bash
+        working-directory: ${{ env.PROJ }}
+        run: gradle lintRelease --no-daemon --stacktrace
+
+      - name: Imzali AAB derle
+        if: env.SKIP != '1'
+        shell: bash
+        working-directory: ${{ env.PROJ }}
+        run: gradle bundleRelease --no-daemon --stacktrace
+
+      - name: Anahtari sil
+        if: always()
+        shell: bash
+        run: rm -f "$RUNNER_TEMP/release.jks" "$PROJ/keystore.properties" || true
+
+      - uses: actions/upload-artifact@v7
+        if: env.SKIP != '1'
+        with:
+          name: dns-hizli-aab
+          path: |
+            ${{ env.PROJ }}/app/build/outputs/bundle/release/*.aab
+            ${{ env.PROJ }}/app/build/reports/lint-results-release.html
+          if-no-files-found: error
